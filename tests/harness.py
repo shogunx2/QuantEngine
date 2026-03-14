@@ -1,16 +1,20 @@
 import sys
 import os
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import numpy as np
-import pandas as pd
 from data_loader import DataLoader
 from strategy import MLStrategy
 from backtester import Backtester
-from config import TRAIN_RATIO, FEATURE_COLS
+from config import TRAIN_RATIO
 
 
-def load_and_split(ticker, start, end, train_ratio=TRAIN_RATIO):
+def load_and_split(ticker: str, start: str, end: str, train_ratio: float = TRAIN_RATIO):
+    """
+    Load historical data for a ticker and split into train/test segments.
+
+    Returns (full_data, train_df, test_df).
+    """
     loader = DataLoader(ticker, start, end)
     data = loader.fetch()
     split_idx = int(len(data) * train_ratio)
@@ -22,24 +26,34 @@ def load_and_split(ticker, start, end, train_ratio=TRAIN_RATIO):
     return data, train, test
 
 
-def run_strategy(train, test, threshold=None):
-    from config import MIN_SIGNAL_THRESHOLD
-    threshold = threshold or MIN_SIGNAL_THRESHOLD
+def run_strategy(train, test):
+    """
+    Fit MLStrategy on train data, generate signals on test data,
+    and backtest using the current Backtester API.
 
-    strategy = MLStrategy()
-    strategy.fit(train)
-    predictions = strategy.predict(test)
-    regime = test["Regime_ok"].values
-    signals = strategy.generate_signals(predictions, threshold=threshold, regime=regime)
+    Returns (results, baseline, signals, confidence).
+    """
+    strat = MLStrategy()
+    strat.fit(train)
+    signals, confidence = strat.generate_signals(test)
 
     bt = Backtester()
-    results = bt.run(test["Close"], test["Open"], signals)
-    baseline = bt.buy_and_hold(test["Close"], test["Open"])
+    close = test["Close"]
+    open_ = test["Open"]
+    high = test["High"]
+    low = test["Low"]
+    atr = test["ATR"]
 
-    return results, baseline, signals, predictions
+    results = bt.run(close, open_, high, low, atr, signals)
+    baseline = bt.buy_and_hold(close, open_)
+
+    return results, baseline, signals, confidence
 
 
 def print_results(label, results, baseline):
+    """
+    Convenience printer for ML vs buy-and-hold results.
+    """
     print(f"\n--- {label} ---")
     print(f"ML Return:    {results['total_return']:+.2f}% (₹{results['final_value']:,.2f})")
     print(f"Buy & Hold:   {baseline['total_return']:+.2f}% (₹{baseline['final_value']:,.2f})")
