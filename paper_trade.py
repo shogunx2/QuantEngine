@@ -9,10 +9,18 @@ import yfinance as yf
 from datetime import datetime, timedelta
 from data_loader import DataLoader
 from strategy import MLStrategy
+from costs import entry_cost, exit_cost
 from config import (
-    TP_ATR_MULT, SL_ATR_MULT, TRAIL_ATR_MULT, META_CONFIDENCE,
-    INITIAL_CAPITAL, MAX_HOLD_DAYS, EOD_SAFE_HOUR, EOD_SAFE_MINUTE,
+    TP_ATR_MULT,
+    SL_ATR_MULT,
+    TRAIL_ATR_MULT,
+    META_CONFIDENCE,
+    INITIAL_CAPITAL,
+    MAX_HOLD_DAYS,
+    EOD_SAFE_HOUR,
+    EOD_SAFE_MINUTE,
 )
+from risk import apply_trailing, evaluate_exit
 
 WATCHLIST = [
     "ADANIENT", "ATGL", "RELIANCE", "TATASTEEL", "HDFCBANK",
@@ -22,6 +30,12 @@ WATCHLIST = [
 LOOKBACK_YEARS = 5
 LEDGER_PATH = "paper_trades/ledger.json"
 EXCEL_PATH = "paper_trades/portfolio.xlsx"
+
+# Volatility-adjusted position sizing:
+# - risk a fixed fraction of current capital per trade
+# - scale quantity inversely with ATR-stop distance
+RISK_PER_TRADE = 0.01  # 1% of current capital per trade
+MAX_POSITION_FRACTION = 0.2  # cap notional per trade at 20% of capital
 
 
 def load_ledger():
@@ -101,42 +115,55 @@ def update_open_trades(ledger, today_str):
         day_open = prices["open"]
         atr = trade["atr"]
 
-        if not trade["trailing_active"] and high >= trade["tp_activation"]:
-            trade["trailing_active"] = True
-            trade["trail_stop"] = high - TRAIL_ATR_MULT * atr
+        trade["trailing_active"], trade["trail_stop"], _ = apply_trailing(
+            high=high,
+            atr=atr,
+            trailing_active=trade["trailing_active"],
+            tp_activation=trade["tp_activation"],
+            current_trailing_stop=trade["trail_stop"],
+            trail_mult=TRAIL_ATR_MULT,
+        )
 
-        if trade["trailing_active"]:
-            new_trail = high - TRAIL_ATR_MULT * atr
-            if new_trail > trade["trail_stop"]:
-                trade["trail_stop"] = new_trail
+        exit_price, reason = evaluate_exit(
+            day_open=day_open,
+            low=low,
+            close=close,
+            base_sl=trade["sl"],
+            trailing_active=trade["trailing_active"],
+            trailing_stop=trade["trail_stop"],
+            hold_days=trade["hold_days"],
+            max_hold_days=MAX_HOLD_DAYS,
+        )
 
-        exit_price = None
-        exit_reason = None
-
-        # Gap-through logic: if the day opened at or below the stop,
-        # exit at the actual open price (not the theoretical SL).
-        if low <= trade["sl"] and not trade["trailing_active"]:
-            if day_open <= trade["sl"]:
-                exit_price = day_open
+        if exit_price is not None:
+            if reason == "SL_GAP":
                 exit_reason = "STOP LOSS (GAP)"
-            else:
-                exit_price = trade["sl"]
+            elif reason == "SL":
                 exit_reason = "STOP LOSS"
-        elif trade["trailing_active"] and low <= trade["trail_stop"]:
-            if day_open <= trade["trail_stop"]:
-                exit_price = day_open
+            elif reason == "TRAIL_GAP":
                 exit_reason = "TRAIL STOP (GAP)"
-            else:
-                exit_price = trade["trail_stop"]
+            elif reason == "TRAIL":
                 exit_reason = "TRAILING STOP"
-        elif not trade["trailing_active"] and trade["hold_days"] >= MAX_HOLD_DAYS:
-            exit_price = close
-            exit_reason = "TIME EXIT"
+            elif reason == "TIME":
+                exit_reason = "TIME EXIT"
+            else:
+                exit_reason = "EXIT"
 
-        if exit_price:
-            pnl = exit_price - trade["entry_price"]
-            pnl_pct = (pnl / trade["entry_price"]) * 100
-            ledger["capital"] += pnl
+            qty = trade.get("quantity")
+            if qty is None or "allocated_capital" not in trade:
+                # Legacy trades: approximate per-share PnL without detailed costs.
+                pnl = exit_price - trade["entry_price"]
+                pnl_pct = (pnl / trade["entry_price"]) * 100 if trade["entry_price"] else 0.0
+                ledger["capital"] += exit_price
+            else:
+                trade_value = exit_price * qty
+                total_exit_cost = exit_cost(trade_value)
+                exit_total = trade_value - total_exit_cost
+                entry_total = trade["allocated_capital"]
+                pnl = exit_total - entry_total
+                pnl_pct = (pnl / entry_total) * 100 if entry_total else 0.0
+                ledger["capital"] += exit_total
+
             closed = {
                 **trade,
                 "exit_date": today_str,
@@ -149,7 +176,8 @@ def update_open_trades(ledger, today_str):
             print(f"    CLOSED {ticker}: {exit_reason} @ ₹{exit_price:.2f}  "
                   f"PnL=₹{pnl:+.2f} ({pnl_pct:+.2f}%)")
         else:
-            unr_pnl = close - trade["entry_price"]
+            qty = trade.get("quantity", 1)
+            unr_pnl = (close - trade["entry_price"]) * qty
             trade["unrealized_pnl"] = round(unr_pnl, 2)
             trade["current_price"] = round(close, 2)
             still_open.append(trade)
@@ -168,10 +196,41 @@ def open_new_trades(ledger, signals, today_str):
 
         entry = sig["close"]
         atr = sig["atr"]
+
+        if atr <= 0:
+            continue
+
+        capital = ledger["capital"]
+        if capital <= 0:
+            break
+
+        risk_capital = capital * RISK_PER_TRADE
+        stop_distance = SL_ATR_MULT * atr
+        if stop_distance <= 0:
+            continue
+
+        qty_risk = int(risk_capital // stop_distance)
+        max_notional = capital * MAX_POSITION_FRACTION
+        qty_cap = int(max_notional // entry) if entry > 0 else 0
+
+        qty = min(qty_risk, qty_cap)
+        if qty <= 0:
+            continue
+
+        notional = qty * entry
+        total_entry_cost = entry_cost(notional)
+        total_used = notional + total_entry_cost
+        if total_used > capital:
+            continue
+
+        ledger["capital"] -= total_used
+
         trade = {
             "ticker": sig["ticker"],
             "entry_date": today_str,
             "entry_price": round(entry, 2),
+            "quantity": qty,
+            "allocated_capital": round(total_used, 2),
             "atr": round(atr, 2),
             "sl": round(entry - SL_ATR_MULT * atr, 2),
             "tp_activation": round(entry + TP_ATR_MULT * atr, 2),
@@ -184,9 +243,9 @@ def open_new_trades(ledger, signals, today_str):
             "current_price": round(entry, 2),
         }
         ledger["open_trades"].append(trade)
-        print(f"    OPENED {sig['ticker']}: BUY @ ₹{entry:.2f}  "
+        print(f"    OPENED {sig['ticker']}: BUY x{qty} @ ₹{entry:.2f}  "
               f"SL=₹{trade['sl']:.2f}  TP_Act=₹{trade['tp_activation']:.2f}  "
-              f"Conf={sig['confidence']:.3f}")
+              f"Risk≈₹{risk_capital:.0f}  Conf={sig['confidence']:.3f}")
 
 
 def save_excel(ledger):
@@ -205,8 +264,8 @@ def save_excel(ledger):
 
         if ledger["open_trades"]:
             open_df = pd.DataFrame(ledger["open_trades"])
-            cols = ["ticker", "entry_date", "entry_price", "current_price",
-                    "unrealized_pnl", "sl", "tp_activation", "trail_stop",
+            cols = ["ticker", "entry_date", "entry_price", "quantity", "allocated_capital",
+                    "current_price", "unrealized_pnl", "sl", "tp_activation", "trail_stop",
                     "trailing_active", "hold_days", "confidence", "regime"]
             open_df = open_df[[c for c in cols if c in open_df.columns]]
             open_df.to_excel(writer, sheet_name="Open Trades", index=False)

@@ -1,9 +1,13 @@
 import numpy as np
 from config import (
-    BROKERAGE_RATE, BROKERAGE_CAP, SLIPPAGE_RATE, STT_RATE,
-    DP_CHARGE, INITIAL_CAPITAL, MAX_HOLD_DAYS,
-    TP_ATR_MULT, SL_ATR_MULT, TRAIL_ATR_MULT,
+    INITIAL_CAPITAL,
+    MAX_HOLD_DAYS,
+    TP_ATR_MULT,
+    SL_ATR_MULT,
+    TRAIL_ATR_MULT,
 )
+from costs import entry_cost, exit_cost
+from risk import apply_trailing, evaluate_exit
 
 
 class Backtester:
@@ -11,12 +15,14 @@ class Backtester:
         self.initial_capital = initial_capital
 
     def _entry_cost_rate(self, trade_value):
-        brokerage = min(trade_value * BROKERAGE_RATE, BROKERAGE_CAP) / trade_value
-        return brokerage + SLIPPAGE_RATE
+        if trade_value <= 0:
+            return 0.0
+        return entry_cost(trade_value) / trade_value
 
     def _exit_cost(self, trade_value):
-        brokerage = min(trade_value * BROKERAGE_RATE, BROKERAGE_CAP)
-        return brokerage + trade_value * (SLIPPAGE_RATE + STT_RATE) + DP_CHARGE
+        if trade_value <= 0:
+            return 0.0
+        return exit_cost(trade_value)
 
     def _trade_return(self, entry_price, exit_price, quantity):
         entry_value = entry_price * quantity
@@ -30,9 +36,10 @@ class Backtester:
         holdings = 0
         entry_price = 0.0
         hold_days = 0
-        sl_level = 0.0
+        base_sl = 0.0
         tp_activation = 0.0
         trailing_active = False
+        trailing_stop = 0.0
         portfolio_values = []
         trades = []
         pending_signal = None
@@ -55,7 +62,8 @@ class Backtester:
                     entry_price = open_
                     entry_atr = cur_atr
                     tp_activation = entry_price + TP_ATR_MULT * entry_atr
-                    sl_level = entry_price - SL_ATR_MULT * entry_atr
+                    base_sl = entry_price - SL_ATR_MULT * entry_atr
+                    trailing_stop = base_sl
                     trailing_active = False
                     cost = qty * open_ * cost_rate
                     cash -= qty * open_ + cost
@@ -79,27 +87,32 @@ class Backtester:
             if holdings > 0:
                 hold_days += 1
 
-                if not trailing_active and high >= tp_activation:
-                    trailing_active = True
-                    sl_level = high - TRAIL_ATR_MULT * cur_atr
+                trailing_active, trailing_stop, _ = apply_trailing(
+                    high=high,
+                    atr=cur_atr,
+                    trailing_active=trailing_active,
+                    tp_activation=tp_activation,
+                    current_trailing_stop=trailing_stop,
+                    trail_mult=TRAIL_ATR_MULT,
+                )
 
-                if trailing_active:
-                    new_trail = high - TRAIL_ATR_MULT * cur_atr
-                    if new_trail > sl_level:
-                        sl_level = new_trail
+                exit_price, reason = evaluate_exit(
+                    day_open=open_,
+                    low=low,
+                    close=close,
+                    base_sl=base_sl,
+                    trailing_active=trailing_active,
+                    trailing_stop=trailing_stop,
+                    hold_days=hold_days,
+                    max_hold_days=None,  # time exits handled via pending SELL signal
+                )
 
-                if low <= sl_level:
-                    # Gap-through: if the day opened at/below the stop,
-                    # we exit at the open (can't get the theoretical price).
-                    if open_ <= sl_level:
-                        exit_price = open_
-                    else:
-                        exit_price = sl_level
+                if exit_price is not None:
                     trade_value = holdings * exit_price
                     cost = self._exit_cost(trade_value)
                     cash += trade_value - cost
                     ret = self._trade_return(entry_price, exit_price, holdings)
-                    if trailing_active:
+                    if reason in ("TRAIL", "TRAIL_GAP"):
                         trades.append(("SELL", close_prices.index[i], exit_price, holdings, ret, "trail"))
                         trail_hits += 1
                     else:

@@ -7,9 +7,15 @@ import time
 import pandas as pd
 from datetime import datetime, timedelta
 from config import (
-    TP_ATR_MULT, SL_ATR_MULT, TRAIL_ATR_MULT, MAX_HOLD_DAYS, INITIAL_CAPITAL,
+    TP_ATR_MULT,
+    SL_ATR_MULT,
+    TRAIL_ATR_MULT,
+    MAX_HOLD_DAYS,
+    INITIAL_CAPITAL,
 )
 from broker_feed import get_feed
+from costs import exit_cost
+from risk import apply_trailing, evaluate_exit
 
 LEDGER_PATH = "paper_trades/ledger.json"
 POLL_INTERVAL = 60
@@ -56,29 +62,41 @@ def check_trade(trade, price_data):
     atr = trade["atr"]
     events = []
 
-    if not trade["trailing_active"] and high >= trade["tp_activation"]:
-        trade["trailing_active"] = True
-        trade["trail_stop"] = round(high - TRAIL_ATR_MULT * atr, 2)
-        events.append(("TRAIL_ACTIVATED", trade["trail_stop"]))
+    trade["trailing_active"], trade["trail_stop"], trail_events = apply_trailing(
+        high=high,
+        atr=atr,
+        trailing_active=trade["trailing_active"],
+        tp_activation=trade["tp_activation"],
+        current_trailing_stop=trade["trail_stop"],
+        trail_mult=TRAIL_ATR_MULT,
+    )
 
-    if trade["trailing_active"]:
-        new_trail = round(high - TRAIL_ATR_MULT * atr, 2)
-        if new_trail > trade["trail_stop"]:
-            trade["trail_stop"] = new_trail
-            events.append(("TRAIL_RAISED", new_trail))
+    for ev in trail_events:
+        events.append((ev.type, ev.level))
 
-    exit_price = None
-    exit_reason = None
     day_open = price_data["open"]
 
-    # Gap-through logic: if the day opened below the stop level,
-    # we can't get the theoretical price — exit at the actual open.
-    if not trade["trailing_active"] and low <= trade["sl"]:
-        exit_price = day_open if day_open <= trade["sl"] else trade["sl"]
-        exit_reason = "STOP LOSS (GAP)" if day_open <= trade["sl"] else "STOP LOSS"
-    elif trade["trailing_active"] and low <= trade["trail_stop"]:
-        exit_price = day_open if day_open <= trade["trail_stop"] else trade["trail_stop"]
-        exit_reason = "TRAIL STOP (GAP)" if day_open <= trade["trail_stop"] else "TRAILING STOP"
+    exit_price, reason = evaluate_exit(
+        day_open=day_open,
+        low=low,
+        close=last,
+        base_sl=trade["sl"],
+        trailing_active=trade["trailing_active"],
+        trailing_stop=trade["trail_stop"],
+        hold_days=trade.get("hold_days", 0),
+        max_hold_days=None,
+    )
+
+    if reason == "SL_GAP":
+        exit_reason = "STOP LOSS (GAP)"
+    elif reason == "SL":
+        exit_reason = "STOP LOSS"
+    elif reason == "TRAIL_GAP":
+        exit_reason = "TRAIL STOP (GAP)"
+    elif reason == "TRAIL":
+        exit_reason = "TRAILING STOP"
+    else:
+        exit_reason = None
 
     trade["current_price"] = round(last, 2)
     trade["unrealized_pnl"] = round(last - trade["entry_price"], 2)
@@ -108,8 +126,10 @@ def print_dashboard(ledger, prices):
     for t in ledger["open_trades"]:
         entry = t["entry_price"]
         now_p = t["current_price"]
-        pnl = now_p - entry
-        pnl_pct = (pnl / entry) * 100
+        qty = t.get("quantity", 1)
+        pnl = (now_p - entry) * qty
+        entry_notional = entry * qty
+        pnl_pct = (pnl / entry_notional) * 100 if entry_notional else 0.0
 
         if t["trailing_active"]:
             barrier = t["trail_stop"]
@@ -192,9 +212,20 @@ def run_monitor():
                     print(f"\n  *** {ticker} trail stop raised to ₹{val:.2f} ***")
 
             if exit_price:
-                pnl = exit_price - trade["entry_price"]
-                pnl_pct = (pnl / trade["entry_price"]) * 100
-                ledger["capital"] += pnl
+                qty = trade.get("quantity")
+                if qty is None or "allocated_capital" not in trade:
+                    # Legacy trades: approximate per-share PnL without detailed costs.
+                    pnl = exit_price - trade["entry_price"]
+                    pnl_pct = (pnl / trade["entry_price"]) * 100 if trade["entry_price"] else 0.0
+                    ledger["capital"] += exit_price
+                else:
+                    trade_value = exit_price * qty
+                    total_exit_cost = exit_cost(trade_value)
+                    exit_total = trade_value - total_exit_cost
+                    entry_total = trade["allocated_capital"]
+                    pnl = exit_total - entry_total
+                    pnl_pct = (pnl / entry_total) * 100 if entry_total else 0.0
+                    ledger["capital"] += exit_total
                 closed = {
                     **trade,
                     "exit_date": datetime.now().strftime("%Y-%m-%d"),
