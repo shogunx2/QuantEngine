@@ -1,0 +1,27 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.env
+!.env.example
+reports/
+build/
+*.so
+*.dylib
+live/logs/
+live_model.pkl
+logs/
+
+# Local runtime state and generated outputs
+paper_trades/*.log
+paper_trades/*.xlsx
+paper_trades/*.csv
+paper_trades/ledger.json
+
+# OS/editor noise
+.DS_Store
+.idea/

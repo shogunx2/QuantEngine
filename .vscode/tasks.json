@@ -1,0 +1,15 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Live Monitor",
+			"type": "shell",
+			"command": ".venv/bin/python",
+			"args": [
+				"live_monitor.py"
+			],
+			"isBackground": true,
+			"group": "build"
+		}
+	]
+}
